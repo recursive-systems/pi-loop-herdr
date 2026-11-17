@@ -1,0 +1,11 @@
+{
+  "name": "pi-loop-herdr",
+  "version": "0.1.0",
+  "description": "Every pi-loop run that wakes a model shows up in Herdr as a named terminal you can watch, steer and take over, under the session that runs the loop.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "keywords": ["pi-package", "pi", "pi-extension", "pi-loop", "herdr"],
+  "repository": { "type": "git", "url": "git+https://github.com/recursive-systems/pi-loop-herdr.git" },
+  "pi": { "extensions": ["./index.ts"], "skills": ["./skills/pi-loop-herdr"] }
+}
