@@ -8,6 +8,11 @@ steer it, or press Tab to take it over: it becomes a regular Pi on the run's con
 still gets its report. When the run ends, its terminal stays, showing done, failed or needs you,
 and older finished ones are cleaned up (the newest two per loop, for up to 6 hours).
 
+With pi-loop's `pi` runner (`"loop": { "runner": "pi" }` in settings) there is no watcher: the terminal
+`loop-<id>-<fire>` IS the run, an ordinary Pi session you attach to and type into. It outlives the session that
+runs the loop, so restarting that session picks the run up instead of losing it, and it stays open for a while
+after the run is recorded (then pi-loop closes it). Its labels add `loop-kind=run` and `loop-runner=pi`.
+
 Anything the run starts with `hc run` sits under the run's terminal, and runs are asked to name what
 they start after the job.
 

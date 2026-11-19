@@ -1,10 +1,14 @@
 /**
- * pi-loop-herdr: every pi-loop run that wakes a model shows up in Herdr (`hc`) as a named terminal you can
- * watch, steer and take over, under the terminal the loop's session runs in. What the run starts with `hc run`
- * sits under the run's terminal.
+ * pi-loop-herdr: every pi-loop run that wakes a model shows up in Herdr (`hc`) as a named terminal, under the
+ * terminal the loop's session runs in. What the run starts with `hc run` sits under the run's terminal.
  *
- * It only listens to pi-loop's `loop:run` events on pi.events. If hc is missing or fails, it does nothing and
- * the loops are unaffected.
+ *   rpc runner (pi-loop's default): the terminal holds a watcher of the hidden run, to watch, steer and take over
+ *   pi runner (or any terminal runner): the terminal IS the run, an ordinary agent session you type into; it
+ *           answers pi-loop's `loop:terminal` requests (v1) with a real terminal, which outlives the loop's
+ *           session so a restart picks the run up instead of losing it
+ *
+ * It only listens on pi.events. If hc is missing or fails, it does nothing: rpc loops run as before, and a
+ * terminal runner's run fails, saying nothing supplied a terminal.
  */
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
@@ -17,6 +21,8 @@ type ExtensionAPI = any;
 const KEEP_PER_LOOP = 2;
 const KEEP_MS = 6 * 60 * 60_000;
 const LABEL = "loop-by=pi-loop-herdr";
+/** Labels a terminal that IS a run (not a watcher). */
+const RUN_LABEL = "loop-kind=run";
 
 /** The core's socket: its lock file names it (shells may look elsewhere by default). */
 function socket(): string | undefined {
@@ -105,11 +111,18 @@ export default function loopHerdr(pi: ExtensionAPI) {
 		let list: any;
 		try { list = await hc(sock, ["ls", "--all", "--json", "--label", LABEL]); } catch { return; }
 		const now = Date.now();
-		const ended: { address: string; loop: string; at: number }[] = [];
+		const ended: { address: string; loop: string; at: number; finished?: boolean }[] = [];
 		for (const t of list?.terminals ?? []) {
-			if (t.state === "finished") { try { await hc(sock, ["rm", t.address]); } catch { /* gone */ } continue; }
 			let g: any;
 			try { g = await hc(sock, ["get", t.address, "--json"]); } catch { continue; }
+			// A run's own terminal: pi-loop ends its session; once finished it is kept like a watcher (its last screen).
+			if (g?.labels?.["loop-kind"] === "run") {
+				if (t.state !== "finished") continue;
+				const at = Number(g.labels["loop-ended"]) || Number(g.finished_ms) || 0;
+				ended.push({ address: t.address, loop: g.labels.loop ?? "", at, finished: true });
+				continue;
+			}
+			if (t.state === "finished") { try { await hc(sock, ["rm", t.address]); } catch { /* gone */ } continue; }
 			// Never one the owner works in: a taken-over run's own Pi reports as pi, not pi-loop.
 			if (g?.status && g.status.app !== "pi-loop") continue;
 			const at = Number(g?.labels?.["loop-ended"]);
@@ -121,13 +134,58 @@ export default function loopHerdr(pi: ExtensionAPI) {
 			xs.sort((a, b) => b.at - a.at);
 			for (const [i, x] of xs.entries()) {
 				if (i < KEEP_PER_LOOP && now - x.at < KEEP_MS) continue;
-				try { await hc(sock, ["kill", x.address]); await hc(sock, ["rm", x.address]); } catch { /* gone */ }
+				try { if (!x.finished) await hc(sock, ["kill", x.address]); await hc(sock, ["rm", x.address]); } catch { /* gone */ }
 			}
 		}
 	}
 
+	/** A terminal for a run that is itself an agent session: started once pi-loop has written what it runs. */
+	async function open(r: any, sock: string): Promise<any> {
+		await r.ready;
+		const parent = process.env.HC_TERMINAL_ID;
+		for (let i = 0; i < 4; i++) {
+			const name = hcName(`loop-${r.loop}`, i ? `-${r.fire}-${i + 1}` : `-${r.fire}`);
+			try {
+				// --outlive-parent: the run is an ordinary session; restarting the loop's session must not end it.
+				const t = await hc(sock, ["run", "--bg", "--json", "--name", name, "--cwd", r.cwd, "--no-notify", "--outlive-parent",
+					"--label", `loop=${r.loop}`, "--label", `loop-fire=${r.fire}`, "--label", `loop-runner=${r.runner}`, "--label", LABEL, "--label", RUN_LABEL,
+					...(parent ? ["--parent", parent] : ["--no-parent"]), "--", ...r.argv], 20_000);
+				if (!t?.address) return undefined;
+				const address: string = t.address;
+				return {
+					id: address, attach: `hc attach ${address}`,
+					close: async () => { await hc(sock, ["kill", address]).catch(() => undefined); },
+					send: async (text: string) => { try { await hc(sock, ["send", address, text]); return undefined; } catch (err: any) { return String(err?.stderr || err?.message || err).slice(0, 200); } },
+				};
+			} catch (err: any) {
+				if (!/name|taken|exists|unique/i.test(String(err?.message ?? "") + String(err?.stderr ?? ""))) return undefined;
+			}
+		}
+		return undefined;
+	}
+
+	pi.events.on("loop:terminal", (r: any) => {
+		if (r?.v !== 1) return;
+		const sock = socket();
+		if (!sock || !hcBinary()) return;
+		if (r.op === "probe" && typeof r.here === "function") { r.here(); return; }
+		if (r.op !== "open" || typeof r.provide !== "function" || !Array.isArray(r.argv)) return;
+		// The terminal sets these for its own program; the run's environment must not override them.
+		if (Array.isArray(r.inherit)) r.inherit.push("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HERDR_*");
+		r.provide(open(r, sock).catch(() => undefined));
+	});
+
 	pi.events.on("loop:run", (e: any) => {
-		if (e?.v !== 1 || !e.watch?.argv?.length) return;
+		if (e?.v !== 1) return;
+		// A run in its own terminal: label it with how it ended (pi-loop closes its session; finished ones are swept).
+		if (!e.watch?.argv?.length) {
+			const sock = socket();
+			if (!e.terminal || !sock || !hcBinary()) return;
+			// A thread's next fire carries on in the same terminal: its labels follow the fire.
+			if (e.phase === "running") void hc(sock, ["label", e.terminal, `loop-fire=${e.fire}`, "loop-status=running", "loop-ended="]).catch(() => undefined);
+			if (e.phase === "end") void hc(sock, ["label", e.terminal, `loop-status=${e.status}`, `loop-ended=${Date.now()}`]).catch(() => undefined);
+			return;
+		}
 		const sock = socket();
 		if (!sock || !hcBinary()) return;
 		if (e.phase === "start" && typeof e.waitFor === "function" && e.env) {
