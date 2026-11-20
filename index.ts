@@ -9,6 +9,9 @@
  *
  * It only listens on pi.events. If hc is missing or fails, it does nothing: rpc loops run as before, and a
  * terminal runner's run fails, saying nothing supplied a terminal.
+ *
+ * It owns exactly what it opened: every terminal carries this session's owner label (loop-owner=<token>, per project
+ * folder), and it labels, kills and removes only terminals with that label, re-checked just before acting.
  */
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
@@ -21,12 +24,23 @@ type ExtensionAPI = any;
 const KEEP_PER_LOOP = 2;
 const KEEP_MS = 6 * 60 * 60_000;
 const LABEL = "loop-by=pi-loop-herdr";
-/** A watcher whose run ended with no end label (a reload of an older version lost it) is swept once its own status has said so this long. */
-const UNLABELLED_GRACE_MS = 10 * 60_000;
-/** After a sweep that couldn't list run terminals, another is tried this much later. */
-const SWEEP_RETRY_MS = 5 * 60_000;
 /** Labels a terminal that IS a run (not a watcher). */
 const RUN_LABEL = "loop-kind=run";
+
+/**
+ * Who opened a terminal: this session's owner token, one per project folder and kept for that folder (so a session
+ * that restarts in it is the same owner). Every terminal this extension opens carries `loop-owner=<token>`, and it only
+ * ever labels, kills or removes terminals that carry its own token, re-checked just before acting. Terminals another
+ * session opened, including older versions' (which carry no owner label), are never touched.
+ */
+function ownerToken(project: string): string {
+	const dir = path.join(project, ".pi");
+	const file = path.join(dir, "loop-herdr-owner");
+	try { const t = fs.readFileSync(file, "utf8").trim(); if (/^[a-z0-9]{16,64}$/.test(t)) return t; } catch { /* first time */ }
+	const t = Array.from({ length: 24 }, () => "abcdefghijklmnopqrstuvwxyz0123456789"[Math.floor(Math.random() * 36)]).join("");
+	try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(file, t + "\n", { mode: 0o600 }); } catch { /* not writable: this process only */ }
+	return t;
+}
 
 /** The core's socket: its lock file names it (shells may look elsewhere by default). */
 function socket(): string | undefined {
@@ -76,6 +90,16 @@ export default function loopHerdr(pi: ExtensionAPI) {
 	/** `<loop>#<fire>` -> its terminal, so a run that carries on (after the owner steps out) keeps its terminal. */
 	const byFire: Map<string, string> = g.byFire;
 	let sweeping: Promise<void> | undefined;
+	/** This session's owner label (see ownerToken), set once the project is known. */
+	let owner: string | undefined = g.owner;
+	const OWNER = () => `loop-owner=${owner}`;
+	/** A terminal's facts, re-read now; it is ours only if it carries this owner's label. */
+	async function mine(sock: string, address: string): Promise<any | undefined> {
+		if (!owner) return undefined;
+		let t: any;
+		try { t = await hc(sock, ["get", address, "--json"]); } catch { return undefined; }
+		return t?.labels?.["loop-owner"] === owner ? t : undefined;
+	}
 
 	async function start(e: any, sock: string): Promise<void> {
 		const give = (address: string) => {
@@ -89,10 +113,8 @@ export default function loopHerdr(pi: ExtensionAPI) {
 		};
 		const known = byFire.get(`${e.loop}#${e.fire}`);
 		if (known) {
-			try {
-				const g = await hc(sock, ["get", known, "--json"]);
-				if (g?.state === "live") { await label(sock, known, ["loop-status=running", "loop-ended="]); give(known); return; }
-			} catch { /* gone: a new one */ }
+			const t = await mine(sock, known);
+			if (t?.state === "live") { await label(sock, known, ["loop-status=running", "loop-ended="]); give(known); return; }
 		}
 		const loopName = `loop-${e.loop}`;
 		const fire = `-${e.fire}`;
@@ -102,7 +124,7 @@ export default function loopHerdr(pi: ExtensionAPI) {
 			const name = hcName(loopName, i ? `${fire}-${i + 1}` : fire);
 			try {
 				const r = await hc(sock, ["run", "--bg", "--json", "--name", name, "--cwd", e.watch.cwd, "--no-notify",
-					"--label", `loop=${e.loop}`, "--label", `loop-fire=${e.fire}`, "--label", LABEL,
+					"--label", `loop=${e.loop}`, "--label", `loop-fire=${e.fire}`, "--label", LABEL, ...(owner ? ["--label", OWNER()] : []),
 					...(parent ? ["--parent", parent] : ["--no-parent"]),
 					"--", "env", ...envArgs, ...e.watch.argv]);
 				if (r?.address) { give(r.address); return; }
@@ -114,47 +136,36 @@ export default function loopHerdr(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Old finished watchers go: finished terminals at once, live ones whose run ended long ago or beyond the newest few
-	 * per loop (as 0.1.0). A run's own terminal (labelled loop-kind=run) is told apart before any of that, from the one
-	 * listing: never killed, only removed once finished, within the same budget, by its own loop.
+	 * This owner's old terminals go, and nothing else: only terminals labelled with this session's owner token are
+	 * listed, and each is re-checked (still ours, still in the state it was judged in) just before it is touched.
+	 *   a finished watcher            removed at once (as 0.1.0)
+	 *   a live watcher with an end label (pi-loop says its run ended)
+	 *                                 killed and removed beyond the newest two per loop, or after 6 hours (as 0.1.0)
+	 *   a finished run terminal       removed within the same budget; a live run terminal is never touched
+	 * A live watcher without an end label is never killed, whatever its screen says. Terminals of other sessions (another
+	 * owner token, or none: an older version's) are invisible here.
 	 */
 	async function sweep(sock: string): Promise<void> {
+		if (!owner) return;
 		let list: any;
-		try { list = await hc(sock, ["ls", "--all", "--json", "--label", LABEL]); } catch { return; }
-		// Which are runs' own terminals: one listing. If it fails, each candidate is classified by its own labels (hc get)
-		// instead, so cleanup never waits on that listing, and a run's terminal is never taken for a watcher.
-		let runs: any, runAddresses: Set<string> | undefined;
-		try { runs = await hc(sock, ["ls", "--all", "--json", "--label", RUN_LABEL]); if (Array.isArray(runs?.terminals)) runAddresses = new Set(runs.terminals.map((t: any) => t.address)); } catch { /* classify one by one */ }
+		try { list = await hc(sock, ["ls", "--all", "--json", "--label", OWNER()]); } catch { return; }
 		const now = Date.now();
 		const finishedAt = (x: any) => Number(x?.finished_ms ?? x?.times?.finished_ms) || 0;
-		const ended: { address: string; loop: string; at: number; run?: true }[] = [];
+		const ended: { address: string; loop: string; at: number; run: boolean; state: string }[] = [];
 		for (const t of list?.terminals ?? []) {
-			let info: any;
-			const get = async () => (info ??= await hc(sock, ["get", t.address, "--json"]));
-			let isRun: boolean;
-			if (runAddresses) isRun = runAddresses.has(t.address);
-			else { try { isRun = (await get())?.labels?.["loop-kind"] === "run"; } catch { continue; } }
+			const info = await mine(sock, t.address);
+			if (!info) continue;
+			const isRun = info.labels?.["loop-kind"] === "run";
 			if (isRun) {
-				if (t.state !== "finished") continue;
-				try { await get(); } catch { continue; }
-				const at = Number(info?.labels?.["loop-ended"]) || finishedAt(info) || now;
-				ended.push({ address: t.address, loop: `run:${info?.labels?.loop ?? ""}`, at, run: true });
+				if (info.state !== "finished") continue;
+				ended.push({ address: t.address, loop: `run:${info.labels?.loop ?? ""}`, at: Number(info.labels?.["loop-ended"]) || finishedAt(info) || now, run: true, state: "finished" });
 				continue;
 			}
-			// As 0.1.0 from here: a finished watcher goes at once, before anything else is asked about it.
-			if (t.state === "finished") { try { await hc(sock, ["rm", t.address]); } catch { /* gone */ } continue; }
-			try { await get(); } catch { continue; }
-			// Never one the owner works in, nor a run's own terminal (its label is checked again here).
-			if (info?.labels?.["loop-kind"] === "run") continue;
-			if (info?.status && info.status.app !== "pi-loop") continue;
-			// Its end: the label pi-loop sets, or, for a watcher whose run ended across a reload of an older version (no end
-			// label ever came), the watcher's own report that its run is over, once that is old enough.
-			let at = Number(info?.labels?.["loop-ended"]);
-			if (!(Number.isFinite(at) && at > 0) && info?.status && ["done", "error"].includes(info.status.state) && !isTracked(t.address)) {
-				const since = Number(info.status_ms) || 0;
-				if (since && now - since > UNLABELLED_GRACE_MS) at = since;
-			}
-			if (Number.isFinite(at) && at > 0) ended.push({ address: t.address, loop: info.labels?.loop ?? "", at });
+			if (info.state === "finished") { if ((await mine(sock, t.address))?.state === "finished") { try { await hc(sock, ["rm", t.address]); } catch { /* gone */ } } continue; }
+			// A watcher someone went into (its program is no longer the watcher): never touched.
+			if (info.status && info.status.app !== "pi-loop") continue;
+			const at = Number(info.labels?.["loop-ended"]);
+			if (Number.isFinite(at) && at > 0) ended.push({ address: t.address, loop: info.labels?.loop ?? "", at, run: false, state: "live" });
 		}
 		const byLoop = new Map<string, typeof ended>();
 		for (const x of ended) byLoop.set(x.loop, [...(byLoop.get(x.loop) ?? []), x]);
@@ -162,19 +173,12 @@ export default function loopHerdr(pi: ExtensionAPI) {
 			xs.sort((a, b) => b.at - a.at);
 			for (const [i, x] of xs.entries()) {
 				if (i < KEEP_PER_LOOP && now - x.at < KEEP_MS) continue;
-				try { if (!x.run) await hc(sock, ["kill", x.address]); await hc(sock, ["rm", x.address]); } catch { /* gone */ }
+				// Re-checked just before acting: still ours, still what it was judged to be.
+				const now2 = await mine(sock, x.address);
+				if (!now2 || now2.state !== x.state || (x.run ? now2.labels?.["loop-kind"] !== "run" : (now2.labels?.["loop-kind"] === "run" || Number(now2.labels?.["loop-ended"]) !== x.at || (now2.status && now2.status.app !== "pi-loop")))) continue;
+				try { if (x.state === "live") await hc(sock, ["kill", x.address]); await hc(sock, ["rm", x.address]); } catch { /* gone */ }
 			}
 		}
-		// A sweep that had to classify one by one is tried again later, even if nothing else triggers one.
-		if (!runAddresses) retrySoon(sock);
-	}
-	/** A watcher this process still follows (its run hasn't ended here): never swept as unlabelled. */
-	const isTracked = (address: string) => [...terminals.values()].includes(address);
-	let retryTimer: ReturnType<typeof setTimeout> | undefined;
-	function retrySoon(sock: string) {
-		if (retryTimer) return;
-		retryTimer = setTimeout(() => { retryTimer = undefined; sweepSoon(sock); }, SWEEP_RETRY_MS);
-		retryTimer.unref?.();
 	}
 
 	/** A terminal for a run that is itself an agent session. Its argv carries no secrets (pi-loop hands those over itself). */
@@ -186,14 +190,14 @@ export default function loopHerdr(pi: ExtensionAPI) {
 			try {
 				// --outlive-parent: the run is an ordinary session; restarting the loop's session must not end it.
 				const t = await hc(sock, ["run", "--bg", "--json", "--name", name, "--cwd", r.cwd, "--no-notify", "--outlive-parent",
-					"--label", `loop=${r.loop}`, "--label", `loop-fire=${r.fire}`, "--label", `loop-runner=${r.runner}`, "--label", LABEL, "--label", RUN_LABEL,
+					"--label", `loop=${r.loop}`, "--label", `loop-fire=${r.fire}`, "--label", `loop-runner=${r.runner}`, "--label", LABEL, "--label", RUN_LABEL, "--label", OWNER(),
 					...(parent ? ["--parent", parent] : ["--no-parent"]), "--", ...r.argv], 20_000);
 				if (!t?.address) return undefined;
 				const address: string = t.address;
 				return {
 					id: address, attach: `hc attach ${address}`,
-					close: async () => { await hc(sock, ["kill", address]).catch(() => undefined); },
-					send: async (text: string) => { try { await hc(sock, ["send", address, text]); return undefined; } catch (err: any) { return String(err?.stderr || err?.message || err).slice(0, 200); } },
+					close: async () => { if (await mine(sock, address)) await hc(sock, ["kill", address]).catch(() => undefined); },
+					send: async (text: string) => { if (!(await mine(sock, address))) return "its terminal isn't this session's any more"; try { await hc(sock, ["send", address, text]); return undefined; } catch (err: any) { return String(err?.stderr || err?.message || err).slice(0, 200); } },
 				};
 			} catch (err: any) {
 				if (!/name|taken|exists|unique/i.test(String(err?.message ?? "") + String(err?.stderr ?? ""))) return undefined;
@@ -208,6 +212,7 @@ export default function loopHerdr(pi: ExtensionAPI) {
 		if (!sock || !hcBinary()) return;
 		if (r.op === "probe" && typeof r.here === "function") { r.here(); return; }
 		if (r.op !== "open" || typeof r.provide !== "function" || !Array.isArray(r.argv)) return;
+		if (!owner) return; // no owner yet (before session_start): nothing is opened that couldn't be scoped
 		// The terminal sets these for its own program; the run's environment must not override them.
 		if (Array.isArray(r.inherit)) r.inherit.push("HC_*", "HERDR_*");
 		r.provide(open(r, sock).catch(() => undefined));
@@ -216,7 +221,7 @@ export default function loopHerdr(pi: ExtensionAPI) {
 	/** Labels for one terminal, applied in the order they were asked for (separate hc processes would race). */
 	const labelling: Map<string, Promise<unknown>> = g.labelling;
 	function label(sock: string, address: string, labels: string[]): Promise<unknown> {
-		const next = (labelling.get(address) ?? Promise.resolve()).then(() => hc(sock, ["label", address, ...labels])).catch(() => undefined);
+		const next = (labelling.get(address) ?? Promise.resolve()).then(async () => { if (await mine(sock, address)) await hc(sock, ["label", address, ...labels]); }).catch(() => undefined);
 		labelling.set(address, next);
 		void next.then(() => { if (labelling.get(address) === next) labelling.delete(address); });
 		return next;
@@ -235,6 +240,7 @@ export default function loopHerdr(pi: ExtensionAPI) {
 		}
 		const sock = socket();
 		if (!sock || !hcBinary()) return;
+		if (!owner) return; // nothing is opened or touched before this session's owner is known
 		if (e.phase === "start" && typeof e.waitFor === "function" && e.env) {
 			// Before the run's Pi starts, so it gets its terminal's identity (pi-loop waits a few seconds at most).
 			e.waitFor(start(e, sock).catch(() => undefined));
@@ -250,7 +256,8 @@ export default function loopHerdr(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_start", () => {
+	pi.on("session_start", (_e: any, c: any) => {
+		if (!owner && c?.cwd) { owner = ownerToken(c.cwd); g.owner = owner; }
 		const sock = socket();
 		if (sock && hcBinary() && !sweeping) sweeping = sweep(sock).finally(() => { sweeping = undefined; });
 	});
