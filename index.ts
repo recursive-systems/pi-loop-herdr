@@ -84,7 +84,7 @@ export default function loopHerdr(pi: ExtensionAPI) {
 		if (known) {
 			try {
 				const g = await hc(sock, ["get", known, "--json"]);
-				if (g?.state === "live") { await hc(sock, ["label", known, "loop-status=running", "loop-ended="]).catch(() => undefined); give(known); return; }
+				if (g?.state === "live") { await label(sock, known, ["loop-status=running", "loop-ended="]); give(known); return; }
 			} catch { /* gone: a new one */ }
 		}
 		const loopName = `loop-${e.loop}`;
@@ -106,31 +106,36 @@ export default function loopHerdr(pi: ExtensionAPI) {
 		}
 	}
 
-	/** Old finished watchers go: finished terminals at once, live ones whose run ended long ago or beyond the newest few per loop. */
+	/**
+	 * Old finished watchers go: finished terminals at once, live ones whose run ended long ago or beyond the newest few
+	 * per loop (as 0.1.0). A run's own terminal (labelled loop-kind=run) is told apart before any of that, from the one
+	 * listing: never killed, only removed once finished, within the same budget, by its own loop.
+	 */
 	async function sweep(sock: string): Promise<void> {
-		let list: any;
+		let list: any, runs: any;
 		try { list = await hc(sock, ["ls", "--all", "--json", "--label", LABEL]); } catch { return; }
+		// Which are runs' own terminals: one listing, and without it no sweep at all (a run's terminal must never be
+		// taken for a watcher and killed).
+		try { runs = await hc(sock, ["ls", "--all", "--json", "--label", RUN_LABEL]); } catch { return; }
+		if (!Array.isArray(runs?.terminals)) return;
+		const runAddresses = new Set<string>(runs.terminals.map((t: any) => t.address));
 		const now = Date.now();
-		const ended: { address: string; loop: string; at: number; finished?: boolean }[] = [];
-		// A run's own terminals (loop-kind=run): pi-loop ends each run's agent before it records it, so only finished
-		// ones are swept here, kept like watchers (their last screen) within the same budget; a live one is never touched.
-		let runs: any;
-		try { runs = await hc(sock, ["ls", "--all", "--json", "--label", RUN_LABEL]); } catch { runs = undefined; }
-		const runAddresses = new Set<string>((runs?.terminals ?? []).map((t: any) => t.address));
-		for (const t of runs?.terminals ?? []) {
-			if (t.state !== "finished") continue;
-			let g: any;
-			try { g = await hc(sock, ["get", t.address, "--json"]); } catch { continue; }
-			const at = Number(g?.labels?.["loop-ended"]) || Number(g?.finished_ms) || now;
-			ended.push({ address: t.address, loop: `run:${g?.labels?.loop ?? ""}`, at, finished: true });
-		}
+		const ended: { address: string; loop: string; at: number; run?: true }[] = [];
 		for (const t of list?.terminals ?? []) {
-			if (runAddresses.has(t.address)) continue;
-			// As 0.1.0: a finished watcher goes at once, before anything is asked about it.
+			if (runAddresses.has(t.address)) {
+				if (t.state !== "finished") continue;
+				let g: any;
+				try { g = await hc(sock, ["get", t.address, "--json"]); } catch { continue; }
+				const at = Number(g?.labels?.["loop-ended"]) || Number(g?.finished_ms) || now;
+				ended.push({ address: t.address, loop: `run:${g?.labels?.loop ?? ""}`, at, run: true });
+				continue;
+			}
+			// As 0.1.0 from here: a finished watcher goes at once, before anything is asked about it.
 			if (t.state === "finished") { try { await hc(sock, ["rm", t.address]); } catch { /* gone */ } continue; }
 			let g: any;
 			try { g = await hc(sock, ["get", t.address, "--json"]); } catch { continue; }
-			// Never one the owner works in: a taken-over run's own Pi reports as pi, not pi-loop.
+			// Never one the owner works in, nor a run's own terminal (its label is checked again here).
+			if (g?.labels?.["loop-kind"] === "run") continue;
 			if (g?.status && g.status.app !== "pi-loop") continue;
 			const at = Number(g?.labels?.["loop-ended"]);
 			if (Number.isFinite(at) && at > 0) ended.push({ address: t.address, loop: g.labels.loop ?? "", at });
@@ -141,7 +146,7 @@ export default function loopHerdr(pi: ExtensionAPI) {
 			xs.sort((a, b) => b.at - a.at);
 			for (const [i, x] of xs.entries()) {
 				if (i < KEEP_PER_LOOP && now - x.at < KEEP_MS) continue;
-				try { if (!x.finished) await hc(sock, ["kill", x.address]); await hc(sock, ["rm", x.address]); } catch { /* gone */ }
+				try { if (!x.run) await hc(sock, ["kill", x.address]); await hc(sock, ["rm", x.address]); } catch { /* gone */ }
 			}
 		}
 	}

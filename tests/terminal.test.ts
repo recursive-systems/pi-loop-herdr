@@ -19,6 +19,7 @@ if (a[0] === "label" && a.includes("loop-status=running")) { const end = Date.no
 fs.appendFileSync(d + "/calls.log", JSON.stringify(a) + "\\n");
 const ts = fs.existsSync(d + "/terminals.json") ? JSON.parse(fs.readFileSync(d + "/terminals.json", "utf8")) : [];
 if (a[0] === "run") console.log(JSON.stringify({ address: "t7" }));
+else if (a[0] === "ls" && a.includes("loop-kind=run") && fs.existsSync(d + "/fail-run-ls")) { console.error("core busy"); process.exit(1); }
 else if (a[0] === "ls") console.log(JSON.stringify({ terminals: ts.filter(t => a.includes("loop-kind=run") ? t.labels["loop-kind"] === "run" : true) }));
 else if (a[0] === "get") console.log(JSON.stringify(ts.find(t => t.address === a[1]) ?? {}));
 else console.log("{}");
@@ -94,4 +95,13 @@ test("supplies a terminal for a terminal run: hc run with the run's argv, outliv
 	assert.ok(!removed.some(x => x.includes("t7")), "the live one is never touched");
 	assert.ok(!removed.some(x => x.includes("t9")), "the newest finished one stays");
 	assert.ok(!removed.some(x => x.startsWith("kill")), "finished terminals are removed, not killed");
+	// When the listing of run terminals fails, nothing is swept: a live run terminal is never taken for a watcher.
+	const before2 = hc.calls().length;
+	fs.writeFileSync(path.join(dir, "fail-run-ls"), "");
+	fs.writeFileSync(path.join(dir, "terminals.json"), JSON.stringify([
+		{ address: "t7", state: "live", labels: { "loop-kind": "run", loop: "check", "loop-ended": String(t0) }, status: { app: "pi-loop" } },
+	]));
+	pi.events.emit("loop:run", { v: 1, phase: "end", loop: "check", fire: 6, attemptId: "c", terminal: "t7", status: "done" });
+	await new Promise(r => setTimeout(r, 2500));
+	assert.deepEqual(hc.calls().slice(before2).filter(c => c[0] === "rm" || c[0] === "kill"), [], "no sweep without knowing which are runs");
 });
