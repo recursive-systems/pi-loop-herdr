@@ -32,11 +32,13 @@ else console.log("{}");
 }
 
 function bus() {
-	const on = new Map<string, ((d: any) => void)[]>();
-	return { events: { on: (c: string, f: (d: any) => void) => { on.set(c, [...(on.get(c) ?? []), f]); }, emit: (c: string, d: any) => { for (const f of on.get(c) ?? []) f(d); } }, on: () => {} };
+	const on = new Map<string, ((d: any) => void)[]>(), hooks = new Map<string, (() => void)[]>();
+	return { events: { on: (c: string, f: (d: any) => void) => { on.set(c, [...(on.get(c) ?? []), f]); }, emit: (c: string, d: any) => { for (const f of on.get(c) ?? []) f(d); } },
+		on: (e: string, f: () => void) => { hooks.set(e, [...(hooks.get(e) ?? []), f]); }, fire: (e: string) => { for (const f of hooks.get(e) ?? []) f(); } };
 }
 
 test("supplies a terminal for a terminal run: hc run with the run's argv, outliving the loop's session, labelled as a run", async t => {
+	delete (globalThis as any)[Symbol.for("pi-loop-herdr.state.v1")];
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "plh-term-"));
 	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 	const hc = fakeHc(dir);
@@ -95,13 +97,59 @@ test("supplies a terminal for a terminal run: hc run with the run's argv, outliv
 	assert.ok(!removed.some(x => x.includes("t7")), "the live one is never touched");
 	assert.ok(!removed.some(x => x.includes("t9")), "the newest finished one stays");
 	assert.ok(!removed.some(x => x.startsWith("kill")), "finished terminals are removed, not killed");
-	// When the listing of run terminals fails, nothing is swept: a live run terminal is never taken for a watcher.
+	// When the listing of run terminals fails, each candidate is classified by its own labels: a run's terminal (live, with
+	// an old end label) is never killed, and an old finished watcher still goes.
 	const before2 = hc.calls().length;
 	fs.writeFileSync(path.join(dir, "fail-run-ls"), "");
 	fs.writeFileSync(path.join(dir, "terminals.json"), JSON.stringify([
-		{ address: "t7", state: "live", labels: { "loop-kind": "run", loop: "check", "loop-ended": String(t0) }, status: { app: "pi-loop" } },
+		{ address: "t7", state: "live", labels: { "loop-kind": "run", loop: "check", "loop-ended": String(t0) }, status: { app: "pi-loop", state: "done" } },
+		{ address: "w1", state: "finished", labels: { loop: "other" } },
 	]));
 	pi.events.emit("loop:run", { v: 1, phase: "end", loop: "check", fire: 6, attemptId: "c", terminal: "t7", status: "done" });
 	await new Promise(r => setTimeout(r, 2500));
-	assert.deepEqual(hc.calls().slice(before2).filter(c => c[0] === "rm" || c[0] === "kill"), [], "no sweep without knowing which are runs");
+	const acts = hc.calls().slice(before2).filter(c => c[0] === "rm" || c[0] === "kill").map(c => c.join(" "));
+	assert.ok(!acts.some(x => x.includes("t7")), `the run terminal is untouched: ${acts}`);
+	assert.ok(acts.includes("rm w1"), `a finished watcher still goes: ${acts}`);
+	fs.rmSync(path.join(dir, "fail-run-ls"));
+});
+
+test("a watcher whose run ended across a reload is labelled by the new instance; one that never got an end label is swept once its own status says done for long enough", async t => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "plh-reload-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const hc = fakeHc(dir);
+	const saved = { PATH: process.env.PATH, XDG_STATE_HOME: process.env.XDG_STATE_HOME, HC_TERMINAL_ID: process.env.HC_TERMINAL_ID, HC_SESSION: process.env.HC_SESSION };
+	t.after(() => { for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v; });
+	Object.assign(process.env, { PATH: `${hc.bin}:${process.env.PATH}`, XDG_STATE_HOME: path.join(dir, "state"), HC_TERMINAL_ID: "t3" });
+	delete process.env.HC_SESSION;
+	delete (globalThis as any)[Symbol.for("pi-loop-herdr.state.v1")];
+	// The first instance opens a watcher for a run; then a reload builds a second instance, which sees the run's end.
+	const first = bus();
+	loopHerdr(first);
+	const env: Record<string, string> = {};
+	let wait: Promise<unknown> | undefined;
+	first.events.emit("loop:run", { v: 1, phase: "start", loop: "check", fire: 9, attemptId: "z", env, waitFor: (p: Promise<unknown>) => { wait = p; },
+		watch: { argv: ["pi"], env: {}, cwd: dir } });
+	await wait;
+	assert.equal(env.HC_TERMINAL_ID, "t7");
+	const second = bus();
+	loopHerdr(second);
+	second.events.emit("loop:run", { v: 1, phase: "end", loop: "check", fire: 9, attemptId: "z", status: "done", watch: { argv: ["pi"], env: {}, cwd: dir } });
+	await new Promise(r => setTimeout(r, 1500));
+	assert.ok(hc.calls().some(c => c[0] === "label" && c[1] === "t7" && c.includes("loop-status=done")), "the new instance labelled the old watcher");
+	// A watcher an older version left without an end label: its own status says done, past the 6h retention. Swept; a
+	// recent one, or one still working, isn't (an unlabelled one used to be kept for ever).
+	const old = Date.now() - 7 * 60 * 60_000;
+	fs.writeFileSync(path.join(dir, "terminals.json"), JSON.stringify([
+		{ address: "w-old", state: "live", labels: { loop: "a", "loop-by": "pi-loop-herdr" }, status: { app: "pi-loop", state: "done" }, status_ms: old },
+		{ address: "w-new", state: "live", labels: { loop: "b", "loop-by": "pi-loop-herdr" }, status: { app: "pi-loop", state: "done" }, status_ms: Date.now() },
+		{ address: "w-busy", state: "live", labels: { loop: "c", "loop-by": "pi-loop-herdr" }, status: { app: "pi-loop", state: "working" }, status_ms: old },
+	]));
+	const before = hc.calls().length;
+	second.fire("session_start");
+	await new Promise(r => setTimeout(r, 2500));
+	const acts = hc.calls().slice(before).filter(c => c[0] === "rm" || c[0] === "kill").map(c => c.join(" "));
+	assert.ok(acts.includes("kill w-old") && acts.includes("rm w-old"), `the unlabelled old watcher is swept: ${acts} / ${JSON.stringify(hc.calls().slice(before))}`);
+	assert.ok(!acts.some(x => x.includes("w-new")), "a recent one stays");
+	assert.ok(!acts.some(x => x.includes("w-busy")), "a working one stays");
+	delete (globalThis as any)[Symbol.for("pi-loop-herdr.state.v1")];
 });

@@ -21,6 +21,10 @@ type ExtensionAPI = any;
 const KEEP_PER_LOOP = 2;
 const KEEP_MS = 6 * 60 * 60_000;
 const LABEL = "loop-by=pi-loop-herdr";
+/** A watcher whose run ended with no end label (a reload of an older version lost it) is swept once its own status has said so this long. */
+const UNLABELLED_GRACE_MS = 10 * 60_000;
+/** After a sweep that couldn't list run terminals, another is tried this much later. */
+const SWEEP_RETRY_MS = 5 * 60_000;
 /** Labels a terminal that IS a run (not a watcher). */
 const RUN_LABEL = "loop-kind=run";
 
@@ -64,10 +68,13 @@ function hcName(base: string, suffix = ""): string {
 export default function loopHerdr(pi: ExtensionAPI) {
 	// Only the session that runs loops emits loop:run; in a run's own Pi or a watcher this stays idle.
 	if (process.env.PI_LOOP_CHILD === "1" || process.env.PI_LOOP_WATCH) return;
+	// Process-wide (a /reload rebuilds this extension while runs go on): which watcher belongs to which run, the label
+	// queue, and the sweep in progress. A run started before a reload gets its end label from the new instance.
+	const g: any = ((globalThis as any)[Symbol.for("pi-loop-herdr.state.v1")] ??= { terminals: new Map(), byFire: new Map(), labelling: new Map() });
 	/** Run (attemptId) -> its terminal. */
-	const terminals = new Map<string, string>();
+	const terminals: Map<string, string> = g.terminals;
 	/** `<loop>#<fire>` -> its terminal, so a run that carries on (after the owner steps out) keeps its terminal. */
-	const byFire = new Map<string, string>();
+	const byFire: Map<string, string> = g.byFire;
 	let sweeping: Promise<void> | undefined;
 
 	async function start(e: any, sock: string): Promise<void> {
@@ -112,33 +119,42 @@ export default function loopHerdr(pi: ExtensionAPI) {
 	 * listing: never killed, only removed once finished, within the same budget, by its own loop.
 	 */
 	async function sweep(sock: string): Promise<void> {
-		let list: any, runs: any;
+		let list: any;
 		try { list = await hc(sock, ["ls", "--all", "--json", "--label", LABEL]); } catch { return; }
-		// Which are runs' own terminals: one listing, and without it no sweep at all (a run's terminal must never be
-		// taken for a watcher and killed).
-		try { runs = await hc(sock, ["ls", "--all", "--json", "--label", RUN_LABEL]); } catch { return; }
-		if (!Array.isArray(runs?.terminals)) return;
-		const runAddresses = new Set<string>(runs.terminals.map((t: any) => t.address));
+		// Which are runs' own terminals: one listing. If it fails, each candidate is classified by its own labels (hc get)
+		// instead, so cleanup never waits on that listing, and a run's terminal is never taken for a watcher.
+		let runs: any, runAddresses: Set<string> | undefined;
+		try { runs = await hc(sock, ["ls", "--all", "--json", "--label", RUN_LABEL]); if (Array.isArray(runs?.terminals)) runAddresses = new Set(runs.terminals.map((t: any) => t.address)); } catch { /* classify one by one */ }
 		const now = Date.now();
+		const finishedAt = (x: any) => Number(x?.finished_ms ?? x?.times?.finished_ms) || 0;
 		const ended: { address: string; loop: string; at: number; run?: true }[] = [];
 		for (const t of list?.terminals ?? []) {
-			if (runAddresses.has(t.address)) {
+			let info: any;
+			const get = async () => (info ??= await hc(sock, ["get", t.address, "--json"]));
+			let isRun: boolean;
+			if (runAddresses) isRun = runAddresses.has(t.address);
+			else { try { isRun = (await get())?.labels?.["loop-kind"] === "run"; } catch { continue; } }
+			if (isRun) {
 				if (t.state !== "finished") continue;
-				let g: any;
-				try { g = await hc(sock, ["get", t.address, "--json"]); } catch { continue; }
-				const at = Number(g?.labels?.["loop-ended"]) || Number(g?.finished_ms) || now;
-				ended.push({ address: t.address, loop: `run:${g?.labels?.loop ?? ""}`, at, run: true });
+				try { await get(); } catch { continue; }
+				const at = Number(info?.labels?.["loop-ended"]) || finishedAt(info) || now;
+				ended.push({ address: t.address, loop: `run:${info?.labels?.loop ?? ""}`, at, run: true });
 				continue;
 			}
-			// As 0.1.0 from here: a finished watcher goes at once, before anything is asked about it.
+			// As 0.1.0 from here: a finished watcher goes at once, before anything else is asked about it.
 			if (t.state === "finished") { try { await hc(sock, ["rm", t.address]); } catch { /* gone */ } continue; }
-			let g: any;
-			try { g = await hc(sock, ["get", t.address, "--json"]); } catch { continue; }
+			try { await get(); } catch { continue; }
 			// Never one the owner works in, nor a run's own terminal (its label is checked again here).
-			if (g?.labels?.["loop-kind"] === "run") continue;
-			if (g?.status && g.status.app !== "pi-loop") continue;
-			const at = Number(g?.labels?.["loop-ended"]);
-			if (Number.isFinite(at) && at > 0) ended.push({ address: t.address, loop: g.labels.loop ?? "", at });
+			if (info?.labels?.["loop-kind"] === "run") continue;
+			if (info?.status && info.status.app !== "pi-loop") continue;
+			// Its end: the label pi-loop sets, or, for a watcher whose run ended across a reload of an older version (no end
+			// label ever came), the watcher's own report that its run is over, once that is old enough.
+			let at = Number(info?.labels?.["loop-ended"]);
+			if (!(Number.isFinite(at) && at > 0) && info?.status && ["done", "error"].includes(info.status.state) && !isTracked(t.address)) {
+				const since = Number(info.status_ms) || 0;
+				if (since && now - since > UNLABELLED_GRACE_MS) at = since;
+			}
+			if (Number.isFinite(at) && at > 0) ended.push({ address: t.address, loop: info.labels?.loop ?? "", at });
 		}
 		const byLoop = new Map<string, typeof ended>();
 		for (const x of ended) byLoop.set(x.loop, [...(byLoop.get(x.loop) ?? []), x]);
@@ -149,6 +165,16 @@ export default function loopHerdr(pi: ExtensionAPI) {
 				try { if (!x.run) await hc(sock, ["kill", x.address]); await hc(sock, ["rm", x.address]); } catch { /* gone */ }
 			}
 		}
+		// A sweep that had to classify one by one is tried again later, even if nothing else triggers one.
+		if (!runAddresses) retrySoon(sock);
+	}
+	/** A watcher this process still follows (its run hasn't ended here): never swept as unlabelled. */
+	const isTracked = (address: string) => [...terminals.values()].includes(address);
+	let retryTimer: ReturnType<typeof setTimeout> | undefined;
+	function retrySoon(sock: string) {
+		if (retryTimer) return;
+		retryTimer = setTimeout(() => { retryTimer = undefined; sweepSoon(sock); }, SWEEP_RETRY_MS);
+		retryTimer.unref?.();
 	}
 
 	/** A terminal for a run that is itself an agent session. Its argv carries no secrets (pi-loop hands those over itself). */
@@ -188,7 +214,7 @@ export default function loopHerdr(pi: ExtensionAPI) {
 	});
 
 	/** Labels for one terminal, applied in the order they were asked for (separate hc processes would race). */
-	const labelling = new Map<string, Promise<unknown>>();
+	const labelling: Map<string, Promise<unknown>> = g.labelling;
 	function label(sock: string, address: string, labels: string[]): Promise<unknown> {
 		const next = (labelling.get(address) ?? Promise.resolve()).then(() => hc(sock, ["label", address, ...labels])).catch(() => undefined);
 		labelling.set(address, next);
