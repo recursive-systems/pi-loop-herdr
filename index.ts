@@ -171,7 +171,7 @@ export default function loopHerdr(pi: ExtensionAPI) {
 		if (r.op === "probe" && typeof r.here === "function") { r.here(); return; }
 		if (r.op !== "open" || typeof r.provide !== "function" || !Array.isArray(r.argv)) return;
 		// The terminal sets these for its own program; the run's environment must not override them.
-		if (Array.isArray(r.inherit)) r.inherit.push("HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HERDR_*");
+		if (Array.isArray(r.inherit)) r.inherit.push("HC_*", "HERDR_*");
 		r.provide(open(r, sock).catch(() => undefined));
 	});
 

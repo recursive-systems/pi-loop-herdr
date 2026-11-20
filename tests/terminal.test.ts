@@ -49,7 +49,7 @@ test("supplies a terminal for a terminal run: hc run with the run's argv, outliv
 	pi.events.emit("loop:terminal", { v: 1, op: "open", loop: "check", fire: 4, attemptId: "a", runner: "pi", name: "check-4", title: "loop check #4", description: "",
 		project: dir, cwd: dir, argv: ["sh", "/x/run.sh"], ready: new Promise<void>(r => { ready = r; }), inherit, provide: (h: Promise<any>) => { handle = h; } });
 	assert.ok(handle, "provided synchronously");
-	assert.ok(inherit.includes("HC_TERMINAL_ID"), "its terminal identity is the terminal's, not the run's environment");
+	assert.ok(inherit.includes("HC_*"), "its terminal identity is the terminal's, not the run's environment");
 	await new Promise(r => setTimeout(r, 200));
 	assert.equal(fs.existsSync(path.join(dir, "calls.log")), false, "nothing started before ready");
 	ready();
