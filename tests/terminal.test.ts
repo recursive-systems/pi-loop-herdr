@@ -13,9 +13,14 @@ function fakeHc(dir: string) {
 	fs.mkdirSync(bin, { recursive: true });
 	fs.writeFileSync(path.join(bin, "hc"), `#!${process.execPath}
 const fs = require("fs"), a = process.argv.slice(2);
-fs.appendFileSync(${JSON.stringify(dir)} + "/calls.log", JSON.stringify(a) + "\\n");
+const d = ${JSON.stringify(dir)};
+// A label asking for "running" is slow, as a busy core can be: an unsequenced later "done" would land first.
+if (a[0] === "label" && a.includes("loop-status=running")) { const end = Date.now() + 400; while (Date.now() < end) {} }
+fs.appendFileSync(d + "/calls.log", JSON.stringify(a) + "\\n");
+const ts = fs.existsSync(d + "/terminals.json") ? JSON.parse(fs.readFileSync(d + "/terminals.json", "utf8")) : [];
 if (a[0] === "run") console.log(JSON.stringify({ address: "t7" }));
-else if (a[0] === "ls") console.log(JSON.stringify({ terminals: [] }));
+else if (a[0] === "ls") console.log(JSON.stringify({ terminals: ts.filter(t => a.includes("loop-kind=run") ? t.labels["loop-kind"] === "run" : true) }));
+else if (a[0] === "get") console.log(JSON.stringify(ts.find(t => t.address === a[1]) ?? {}));
 else console.log("{}");
 `, { mode: 0o755 });
 	const state = path.join(dir, "state", "herdr-core", "default");
@@ -66,12 +71,27 @@ test("supplies a terminal for a terminal run: hc run with the run's argv, outliv
 	assert.deepEqual(hc.calls().at(-1), ["send", "t7", "hello"]);
 	await h.close();
 	assert.deepEqual(hc.calls().at(-1), ["kill", "t7"]);
-	// Its labels follow the run (a thread's next fire, then its end); no watcher is started for it.
-	pi.events.emit("loop:run", { v: 1, phase: "running", loop: "check", fire: 5, attemptId: "b", terminal: "t7" });
-	pi.events.emit("loop:run", { v: 1, phase: "end", loop: "check", fire: 5, attemptId: "b", terminal: "t7", status: "done" });
-	await new Promise(r => setTimeout(r, 500));
+	// Its labels follow the run, in order even when the first is slow; no watcher is started for it.
+	pi.events.emit("loop:run", { v: 1, phase: "running", loop: "check", fire: 4, attemptId: "a", terminal: "t7" });
+	pi.events.emit("loop:run", { v: 1, phase: "end", loop: "check", fire: 4, attemptId: "a", terminal: "t7", status: "done" });
+	await new Promise(r => setTimeout(r, 2500));
 	const labels = hc.calls().filter(c => c[0] === "label");
-	assert.deepEqual(labels[0], ["label", "t7", "loop-fire=5", "loop-status=running", "loop-ended="]);
-	assert.equal(labels[1][2], "loop-status=done");
+	assert.deepEqual(labels[0], ["label", "t7", "loop-status=running", "loop-ended="]);
+	assert.equal(labels[1][2], "loop-status=done", "the final label is the last one applied");
 	assert.equal(hc.calls().filter(c => c[0] === "run").length, 1);
+	// A run's end sweeps run terminals too: only finished ones beyond the budget go, a live one never.
+	const before = hc.calls().length;
+	const t0 = Date.now() - 7 * 60 * 60_000;
+	fs.writeFileSync(path.join(dir, "terminals.json"), JSON.stringify([
+		{ address: "t7", state: "live", labels: { "loop-kind": "run", loop: "check" } },
+		{ address: "t8", state: "finished", labels: { "loop-kind": "run", loop: "check", "loop-ended": String(t0) } },
+		{ address: "t9", state: "finished", labels: { "loop-kind": "run", loop: "check", "loop-ended": String(Date.now()) } },
+	]));
+	pi.events.emit("loop:run", { v: 1, phase: "end", loop: "check", fire: 5, attemptId: "b", terminal: "t9", status: "done" });
+	await new Promise(r => setTimeout(r, 2500));
+	const removed = hc.calls().slice(before).filter(c => c[0] === "rm" || c[0] === "kill").map(c => c.join(" "));
+	assert.ok(removed.includes("rm t8"), `the old finished run terminal went: ${removed}`);
+	assert.ok(!removed.some(x => x.includes("t7")), "the live one is never touched");
+	assert.ok(!removed.some(x => x.includes("t9")), "the newest finished one stays");
+	assert.ok(!removed.some(x => x.startsWith("kill")), "finished terminals are removed, not killed");
 });

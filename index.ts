@@ -112,17 +112,24 @@ export default function loopHerdr(pi: ExtensionAPI) {
 		try { list = await hc(sock, ["ls", "--all", "--json", "--label", LABEL]); } catch { return; }
 		const now = Date.now();
 		const ended: { address: string; loop: string; at: number; finished?: boolean }[] = [];
-		for (const t of list?.terminals ?? []) {
+		// A run's own terminals (loop-kind=run): pi-loop ends each run's agent before it records it, so only finished
+		// ones are swept here, kept like watchers (their last screen) within the same budget; a live one is never touched.
+		let runs: any;
+		try { runs = await hc(sock, ["ls", "--all", "--json", "--label", RUN_LABEL]); } catch { runs = undefined; }
+		const runAddresses = new Set<string>((runs?.terminals ?? []).map((t: any) => t.address));
+		for (const t of runs?.terminals ?? []) {
+			if (t.state !== "finished") continue;
 			let g: any;
 			try { g = await hc(sock, ["get", t.address, "--json"]); } catch { continue; }
-			// A run's own terminal: pi-loop ends its session; once finished it is kept like a watcher (its last screen).
-			if (g?.labels?.["loop-kind"] === "run") {
-				if (t.state !== "finished") continue;
-				const at = Number(g.labels["loop-ended"]) || Number(g.finished_ms) || 0;
-				ended.push({ address: t.address, loop: g.labels.loop ?? "", at, finished: true });
-				continue;
-			}
+			const at = Number(g?.labels?.["loop-ended"]) || Number(g?.finished_ms) || now;
+			ended.push({ address: t.address, loop: `run:${g?.labels?.loop ?? ""}`, at, finished: true });
+		}
+		for (const t of list?.terminals ?? []) {
+			if (runAddresses.has(t.address)) continue;
+			// As 0.1.0: a finished watcher goes at once, before anything is asked about it.
 			if (t.state === "finished") { try { await hc(sock, ["rm", t.address]); } catch { /* gone */ } continue; }
+			let g: any;
+			try { g = await hc(sock, ["get", t.address, "--json"]); } catch { continue; }
 			// Never one the owner works in: a taken-over run's own Pi reports as pi, not pi-loop.
 			if (g?.status && g.status.app !== "pi-loop") continue;
 			const at = Number(g?.labels?.["loop-ended"]);
@@ -139,7 +146,7 @@ export default function loopHerdr(pi: ExtensionAPI) {
 		}
 	}
 
-	/** A terminal for a run that is itself an agent session: started once pi-loop has written what it runs. */
+	/** A terminal for a run that is itself an agent session. Its argv carries no secrets (pi-loop hands those over itself). */
 	async function open(r: any, sock: string): Promise<any> {
 		await r.ready;
 		const parent = process.env.HC_TERMINAL_ID;
@@ -175,15 +182,24 @@ export default function loopHerdr(pi: ExtensionAPI) {
 		r.provide(open(r, sock).catch(() => undefined));
 	});
 
+	/** Labels for one terminal, applied in the order they were asked for (separate hc processes would race). */
+	const labelling = new Map<string, Promise<unknown>>();
+	function label(sock: string, address: string, labels: string[]): Promise<unknown> {
+		const next = (labelling.get(address) ?? Promise.resolve()).then(() => hc(sock, ["label", address, ...labels])).catch(() => undefined);
+		labelling.set(address, next);
+		void next.then(() => { if (labelling.get(address) === next) labelling.delete(address); });
+		return next;
+	}
+	const sweepSoon = (sock: string) => { if (!sweeping) sweeping = sweep(sock).finally(() => { sweeping = undefined; }); };
+
 	pi.events.on("loop:run", (e: any) => {
 		if (e?.v !== 1) return;
-		// A run in its own terminal: label it with how it ended (pi-loop closes its session; finished ones are swept).
+		// A run in its own terminal: labelled with how it is going and how it ended; finished ones are swept.
 		if (!e.watch?.argv?.length) {
 			const sock = socket();
 			if (!e.terminal || !sock || !hcBinary()) return;
-			// A thread's next fire carries on in the same terminal: its labels follow the fire.
-			if (e.phase === "running") void hc(sock, ["label", e.terminal, `loop-fire=${e.fire}`, "loop-status=running", "loop-ended="]).catch(() => undefined);
-			if (e.phase === "end") void hc(sock, ["label", e.terminal, `loop-status=${e.status}`, `loop-ended=${Date.now()}`]).catch(() => undefined);
+			if (e.phase === "running") void label(sock, e.terminal, ["loop-status=running", "loop-ended="]);
+			if (e.phase === "end") void label(sock, e.terminal, [`loop-status=${e.status}`, `loop-ended=${Date.now()}`]).then(() => sweepSoon(sock));
 			return;
 		}
 		const sock = socket();
@@ -199,8 +215,7 @@ export default function loopHerdr(pi: ExtensionAPI) {
 			if (!t) return;
 			// It stays, visibly done (or showing that the owner took the run over), until swept.
 			const labels = [`loop-status=${e.status}`, `loop-ended=${Date.now()}`];
-			void hc(sock, ["label", t, ...labels]).catch(() => undefined)
-				.then(() => { if (!sweeping) sweeping = sweep(sock).finally(() => { sweeping = undefined; }); });
+			void label(sock, t, labels).then(() => sweepSoon(sock));
 		}
 	});
 
