@@ -24,4 +24,10 @@ loops run as before.
 Terminals carry labels `loop=<id>`, `loop-fire=<n>`, `loop-status=<status>` (once it ends) and
 `loop-by=pi-loop-herdr`: `hc ls --label loop=<id>` lists one loop's runs.
 
+## Run the tests
+
+Use Node.js 22 (22.6 or later). `npm test` uses Node's TypeScript stripping, which Node 18 does not
+support. With Node 22 on your `PATH`, run `npm test` from the repo root.
+On the Recursive Systems VM, use `PATH=/opt/node22/bin:$PATH npm test` if `node -v` still shows Node 18.
+
 MIT
