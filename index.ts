@@ -58,8 +58,9 @@ function hcName(base: string, suffix = ""): string {
 export default function loopHerdr(pi: ExtensionAPI) {
 	// Only the session that runs loops emits loop:run; in a run's own Pi or a watcher this stays idle.
 	if (process.env.PI_LOOP_CHILD === "1" || process.env.PI_LOOP_WATCH) return;
-	/** Run (attemptId) -> its terminal. */
-	const terminals = new Map<string, string>();
+	// Pi rebinds extensions on a session switch, but an existing run ends on the new event bus.
+	// Keep its exact attempt-to-terminal association in this process until the end event consumes it.
+	const terminals: Map<string, string> = ((globalThis as any)[Symbol.for("pi-loop-herdr.attempt-terminals.v1")] ??= new Map());
 	/** `<loop>#<fire>` -> its terminal, so a run that carries on (after the owner steps out) keeps its terminal. */
 	const byFire = new Map<string, string>();
 	let sweeping: Promise<void> | undefined;

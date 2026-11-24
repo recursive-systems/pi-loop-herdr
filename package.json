@@ -6,6 +6,7 @@
   "private": true,
   "type": "module",
   "keywords": ["pi-package", "pi", "pi-extension", "pi-loop", "herdr"],
+  "scripts": { "test": "node --disable-warning=ExperimentalWarning --experimental-strip-types --test tests/*.test.ts" },
   "repository": { "type": "git", "url": "git+https://github.com/recursive-systems/pi-loop-herdr.git" },
   "pi": { "extensions": ["./index.ts"], "skills": ["./skills/pi-loop-herdr"] }
 }
