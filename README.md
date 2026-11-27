@@ -11,18 +11,23 @@ and older finished ones are cleaned up (the newest two per loop, for up to 6 hou
 Anything the run starts with `hc run` sits under the run's terminal, and runs are asked to name what
 they start after the job.
 
+A loop's native run (pi-loop 0.20's `agents`: Claude Code or Codex itself) is not watched: its program runs in
+that terminal, so attaching gives you an ordinary Claude Code or Codex session. pi-loop follows it through the
+handle this extension gives back (status, screen, keys, send, close). A finished one stays until it is swept,
+unless you have typed into it since its run ended: then it is yours and is never swept.
+
 ## Install
 
 ```bash
-pi install git:github.com/recursive-systems/pi-loop-herdr@v0.1.0
+pi install git:github.com/recursive-systems/pi-loop-herdr@v0.2.0
 ```
 
 Needs pi-loop 0.19 or later and `hc` on `PATH` (or in `~/.local/bin`). It reads the core's socket from
 `~/.local/state/herdr-core/<session>/core.lock`. If `hc` is missing or fails, it does nothing and your
 loops run as before.
 
-Terminals carry labels `loop=<id>`, `loop-fire=<n>`, `loop-status=<status>` (once it ends) and
-`loop-by=pi-loop-herdr`: `hc ls --label loop=<id>` lists one loop's runs.
+Terminals carry labels `loop=<id>`, `loop-fire=<n>`, `loop-status=<status>` (once it ends),
+`loop-native=claude|codex` and `loop-turn=<n>` for a native run, and `loop-by=pi-loop-herdr`: `hc ls --label loop=<id>` lists one loop's runs.
 
 ## Run the tests
 
