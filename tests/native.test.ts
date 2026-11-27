@@ -20,12 +20,16 @@ test("a native run starts its program in a terminal, hands back its handle, and 
 	const terminals: Record<string, any> = {
 		t9: { state: "live", turn: 1, status: { app: "claude-code", state: "done" }, labels: { loop: "x", "loop-native": "claude", "loop-turn": "1", "loop-ended": String(old) } },
 		t10: { state: "live", turn: 3, status: { app: "claude-code", state: "idle" }, labels: { loop: "x", "loop-native": "claude", "loop-turn": "1", "loop-ended": String(old) } },
+		t11: { state: "live", turn: 1, status: { app: "claude-code", state: "done" }, labels: { loop: "x", "loop-native": "claude", "loop-turn": "1", "loop-ended": String(old - 1000) } },
 	};
+	let t11Reads = 0;
 	const exec = t.mock.method(childProcess, "execFile", (_bin: string, args: string[], _o: unknown, cb: (e: unknown, out: string) => void) => {
 		calls.push(args);
 		const [cmd, a1] = args;
 		if (cmd === "run") return cb(null, '{"address":"t8"}');
 		if (cmd === "get" && a1 === "t8") return cb(null, JSON.stringify({ state: "live", turn: 1, status: { app: "claude-code", state: "blocked", kind: "permission", msg: "trust this folder" } }));
+		// t11: unused when the sweep lists it, typed into by the owner before the sweep gets to it.
+		if (cmd === "get" && a1 === "t11" && ++t11Reads > 1) return cb(null, JSON.stringify({ ...terminals.t11, turn: 2, status: { app: "claude-code", state: "working" } }));
 		if (cmd === "get" && terminals[a1]) return cb(null, JSON.stringify(terminals[a1]));
 		if (cmd === "ls") return cb(null, JSON.stringify({ terminals: Object.keys(terminals).map(address => ({ address, state: "live" })) }));
 		if (cmd === "read") return cb(null, "screen text");
@@ -62,4 +66,5 @@ test("a native run starts its program in a terminal, hands back its handle, and 
 	const killed = calls.filter(c => c[0] === "kill").map(c => c[1]);
 	assert.ok(killed.includes("t9"), "an old native session nobody used is swept");
 	assert.ok(!killed.includes("t10"), "one the owner typed into since its run ended is theirs");
+	assert.ok(!killed.includes("t11"), "one the owner started using while the sweep ran stays");
 });

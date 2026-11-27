@@ -138,24 +138,30 @@ export default function loopHerdr(pi: ExtensionAPI) {
 		}
 	}
 
+	/**
+	 * A native session nobody has used since its run ended: still at the turn it ended on, not working, not waiting
+	 * on a person. One the owner typed into (a later turn) is theirs, and is never swept.
+	 */
+	function unusedNative(g: any): boolean {
+		const turn = Number(g?.labels?.["loop-turn"]);
+		return Number.isFinite(turn) && Number(g?.turn) <= turn && g?.state === "live" && g?.status?.state !== "working" && g?.status?.state !== "blocked";
+	}
+
 	/** Old finished watchers go: finished terminals at once, live ones whose run ended long ago or beyond the newest few per loop. */
 	async function sweep(sock: string): Promise<void> {
 		let list: any;
 		try { list = await hc(sock, ["ls", "--all", "--json", "--label", LABEL]); } catch { return; }
 		const now = Date.now();
-		const ended: { address: string; loop: string; at: number }[] = [];
+		const ended: { address: string; loop: string; at: number; native: boolean }[] = [];
 		for (const t of list?.terminals ?? []) {
 			if (t.state === "finished") { try { await hc(sock, ["rm", t.address]); } catch { /* gone */ } continue; }
 			let g: any;
 			try { g = await hc(sock, ["get", t.address, "--json"]); } catch { continue; }
-			if (g?.labels?.["loop-native"]) {
-				// A native session the owner has typed into since its run ended (or that works again) is theirs now.
-				const turn = Number(g.labels["loop-turn"]);
-				if (!Number.isFinite(turn) || Number(g.turn) > turn || g.status?.state === "working" || g.status?.state === "blocked") continue;
+			if (g?.labels?.["loop-native"]) { if (!unusedNative(g)) continue; }
 			// Never one the owner works in: a taken-over run's own Pi reports as pi, not pi-loop.
-			} else if (g?.status && g.status.app !== "pi-loop") continue;
+			else if (g?.status && g.status.app !== "pi-loop") continue;
 			const at = Number(g?.labels?.["loop-ended"]);
-			if (Number.isFinite(at) && at > 0) ended.push({ address: t.address, loop: g.labels.loop ?? "", at });
+			if (Number.isFinite(at) && at > 0) ended.push({ address: t.address, loop: g.labels.loop ?? "", at, native: !!g.labels["loop-native"] });
 		}
 		const byLoop = new Map<string, typeof ended>();
 		for (const x of ended) byLoop.set(x.loop, [...(byLoop.get(x.loop) ?? []), x]);
@@ -163,7 +169,11 @@ export default function loopHerdr(pi: ExtensionAPI) {
 			xs.sort((a, b) => b.at - a.at);
 			for (const [i, x] of xs.entries()) {
 				if (i < KEEP_PER_LOOP && now - x.at < KEEP_MS) continue;
-				try { await hc(sock, ["kill", x.address]); await hc(sock, ["rm", x.address]); } catch { /* gone */ }
+				try {
+					// A native session is looked at again just before it goes: one the owner started using meanwhile stays.
+					if (x.native && !unusedNative(await hc(sock, ["get", x.address, "--json"]))) continue;
+					await hc(sock, ["kill", x.address]); await hc(sock, ["rm", x.address]);
+				} catch { /* gone */ }
 			}
 		}
 	}
