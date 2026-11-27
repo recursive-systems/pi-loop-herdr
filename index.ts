@@ -20,6 +20,9 @@ type ExtensionAPI = any;
 /** Finished watchers kept per loop, and how long a finished one is kept at most. */
 const KEEP_PER_LOOP = 2;
 const KEEP_MS = 6 * 60 * 60_000;
+/** A kept native session is a whole Claude Code or Codex (about 300 MB): the newest one per loop, for 2 hours. */
+const KEEP_NATIVE_PER_LOOP = 1;
+const KEEP_NATIVE_MS = 2 * 60 * 60_000;
 const LABEL = "loop-by=pi-loop-herdr";
 
 /** The core's socket: its lock file names it (shells may look elsewhere by default). */
@@ -168,7 +171,7 @@ export default function loopHerdr(pi: ExtensionAPI) {
 		for (const xs of byLoop.values()) {
 			xs.sort((a, b) => b.at - a.at);
 			for (const [i, x] of xs.entries()) {
-				if (i < KEEP_PER_LOOP && now - x.at < KEEP_MS) continue;
+				if (x.native ? i < KEEP_NATIVE_PER_LOOP && now - x.at < KEEP_NATIVE_MS : i < KEEP_PER_LOOP && now - x.at < KEEP_MS) continue;
 				try {
 					// A native session is looked at again just before it goes: one the owner started using meanwhile stays.
 					if (x.native && !unusedNative(await hc(sock, ["get", x.address, "--json"]))) continue;

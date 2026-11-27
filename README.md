@@ -13,8 +13,9 @@ they start after the job.
 
 A loop's native run (pi-loop 0.20's `agents`: Claude Code or Codex itself) is not watched: its program runs in
 that terminal, so attaching gives you an ordinary Claude Code or Codex session. pi-loop follows it through the
-handle this extension gives back (status, screen, keys, send, close). A finished one stays until it is swept,
-unless you have typed into it since its run ended: then it is yours and is never swept.
+handle this extension gives back (status, screen, keys, send, close). A finished one stays (the newest one per loop, for up to
+2 hours: each is a whole Claude Code or Codex), unless you have typed into it since its run ended: then it is yours
+and is never swept.
 
 ## Install
 
