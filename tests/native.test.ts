@@ -4,6 +4,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 
 // A native run (pi-loop's `native` on a start event): its own program runs in the terminal, under the session's,
@@ -17,16 +18,19 @@ test("a native run starts its program in a terminal, hands back its handle, and 
 	t.after(() => { for (const [k, v] of before) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
 	const calls: string[][] = [];
 	const old = Date.now() - 7 * 60 * 60_000;
+	const shown = createHash("sha256").update("screen text").digest("hex").slice(0, 16);
 	const terminals: Record<string, any> = {
-		t9: { state: "live", turn: 1, status: { app: "claude-code", state: "done" }, labels: { loop: "x", "loop-native": "claude", "loop-turn": "1", "loop-ended": String(old) } },
-		t10: { state: "live", turn: 3, status: { app: "claude-code", state: "idle" }, labels: { loop: "x", "loop-native": "claude", "loop-turn": "1", "loop-ended": String(old) } },
-		t11: { state: "live", turn: 1, status: { app: "claude-code", state: "done" }, labels: { loop: "x", "loop-native": "claude", "loop-turn": "1", "loop-ended": String(old - 1000) } },
+		t9: { state: "live", turn: 1, status: { app: "claude-code", state: "done" }, labels: { loop: "x", "loop-native": "claude", "loop-turn": "1", "loop-screen": shown, "loop-ended": String(old) } },
+		t10: { state: "live", turn: 3, status: { app: "claude-code", state: "idle" }, labels: { loop: "x", "loop-native": "claude", "loop-turn": "1", "loop-screen": shown, "loop-ended": String(old) } },
+		t11: { state: "live", turn: 1, status: { app: "claude-code", state: "done" }, labels: { loop: "x", "loop-native": "claude", "loop-turn": "1", "loop-screen": shown, "loop-ended": String(old - 1000) } },
 	};
 	// A watcher of the same loop, recent: the native sessions don't count against the watchers' own limit.
 	const ago = (m: number) => String(Date.now() - m * 60_000);
-	terminals.t13 = { state: "live", turn: 1, status: { app: "claude-code", state: "done" }, labels: { loop: "z", "loop-native": "claude", "loop-turn": "1", "loop-ended": ago(1) } };
-	terminals.t14 = { state: "live", turn: 1, status: { app: "claude-code", state: "done" }, labels: { loop: "z", "loop-native": "claude", "loop-turn": "1", "loop-ended": ago(2) } };
+	terminals.t13 = { state: "live", turn: 1, status: { app: "claude-code", state: "done" }, labels: { loop: "z", "loop-native": "claude", "loop-turn": "1", "loop-screen": shown, "loop-ended": ago(1) } };
+	terminals.t14 = { state: "live", turn: 1, status: { app: "claude-code", state: "done" }, labels: { loop: "z", "loop-native": "claude", "loop-turn": "1", "loop-screen": shown, "loop-ended": ago(2) } };
 	terminals.t15 = { state: "live", turn: 0, status: { app: "pi-loop", state: "done" }, labels: { loop: "z", "loop-ended": ago(3) } };
+	// t16: nobody pressed Enter, but a draft is on its screen.
+	terminals.t16 = { state: "live", turn: 1, status: { app: "claude-code", state: "idle" }, labels: { loop: "w", "loop-native": "claude", "loop-turn": "1", "loop-screen": shown, "loop-ended": String(old) } };
 	let t11Reads = 0;
 	const exec = t.mock.method(childProcess, "execFile", (_bin: string, args: string[], _o: unknown, cb: (e: unknown, out: string) => void) => {
 		calls.push(args);
@@ -37,7 +41,7 @@ test("a native run starts its program in a terminal, hands back its handle, and 
 		if (cmd === "get" && a1 === "t11" && ++t11Reads > 1) return cb(null, JSON.stringify({ ...terminals.t11, turn: 2, status: { app: "claude-code", state: "working" } }));
 		if (cmd === "get" && terminals[a1]) return cb(null, JSON.stringify(terminals[a1]));
 		if (cmd === "ls") return cb(null, JSON.stringify({ terminals: Object.keys(terminals).map(address => ({ address, state: "live" })) }));
-		if (cmd === "read") return cb(null, "screen text");
+		if (cmd === "read") return cb(null, a1 === "t16" ? "screen text\n❯ half a sentence" : "screen text");
 		if (cmd === "send") return cb(null, '{"started":true}');
 		cb(null, "{}");
 	});
@@ -67,11 +71,12 @@ test("a native run starts its program in a terminal, hands back its handle, and 
 	listener({ ...run, phase: "end", status: "done" });
 	await new Promise(r => setTimeout(r, 100));
 	const label = calls.find(c => c[0] === "label" && c[1] === "t8")!;
-	assert.ok(label.includes("loop-status=done") && label.includes("loop-turn=1"), JSON.stringify(label));
+	assert.ok(label.includes("loop-status=done") && label.includes("loop-turn=1"), JSON.stringify(label)); // its screen is labelled once it settles (15 s)
 	const killed = calls.filter(c => c[0] === "kill").map(c => c[1]);
 	assert.ok(killed.includes("t9"), "an old native session nobody used is swept");
 	assert.ok(!killed.includes("t10"), "one the owner typed into since its run ended is theirs");
 	assert.ok(!killed.includes("t11"), "one the owner started using while the sweep ran stays");
 	assert.ok(!killed.includes("t15"), "a recent watcher is kept by the watchers' own limit, whatever native sessions its loop has");
 	assert.ok(killed.includes("t14") && !killed.includes("t13"), "only the newest native session per loop is kept");
+	assert.ok(!killed.includes("t16"), "one with a draft on its screen is the owner's");
 });

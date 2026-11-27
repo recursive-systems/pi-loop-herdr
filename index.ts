@@ -11,6 +11,7 @@
  * the loops are unaffected (a native run then doesn't start, and its fire moves on to the loop's next model).
  */
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -23,6 +24,8 @@ const KEEP_MS = 6 * 60 * 60_000;
 /** A kept native session is a whole Claude Code or Codex (about 300 MB): the newest one per loop, for 2 hours. */
 const KEEP_NATIVE_PER_LOOP = 1;
 const KEEP_NATIVE_MS = 2 * 60 * 60_000;
+/** How long after a native run ends its screen is taken as the one it ended on. */
+const SCREEN_SETTLE_MS = 15_000;
 const LABEL = "loop-by=pi-loop-herdr";
 
 /** The core's socket: its lock file names it (shells may look elsewhere by default). */
@@ -141,13 +144,20 @@ export default function loopHerdr(pi: ExtensionAPI) {
 		}
 	}
 
+	/** What a terminal shows, as a short digest: a draft someone is typing changes it, though not the turn count. */
+	async function screenOf(sock: string, address: string): Promise<string | undefined> {
+		try { const r = await hc(sock, ["read", address, "--lines", "0"]); return typeof r?.text === "string" ? createHash("sha256").update(r.text).digest("hex").slice(0, 16) : undefined; }
+		catch { return undefined; }
+	}
+
 	/**
-	 * A native session nobody has used since its run ended: still at the turn it ended on, not working, not waiting
-	 * on a person. One the owner typed into (a later turn) is theirs, and is never swept.
+	 * A native session nobody has used since its run ended: the turn it ended on, not working or waiting on a person,
+	 * and the very screen it showed then (a draft being typed changes it). Anything else is the owner's, never swept.
 	 */
-	function unusedNative(g: any): boolean {
-		const turn = Number(g?.labels?.["loop-turn"]);
-		return Number.isFinite(turn) && Number(g?.turn) <= turn && g?.state === "live" && g?.status?.state !== "working" && g?.status?.state !== "blocked";
+	async function unusedNative(sock: string, g: any, address: string): Promise<boolean> {
+		const turn = Number(g?.labels?.["loop-turn"]), screen = g?.labels?.["loop-screen"];
+		if (!Number.isFinite(turn) || !screen || Number(g?.turn) > turn || g?.state !== "live" || g?.status?.state === "working" || g?.status?.state === "blocked") return false;
+		return (await screenOf(sock, address)) === screen;
 	}
 
 	/** Old finished watchers go: finished terminals at once, live ones whose run ended long ago or beyond the newest few per loop. */
@@ -160,7 +170,7 @@ export default function loopHerdr(pi: ExtensionAPI) {
 			if (t.state === "finished") { try { await hc(sock, ["rm", t.address]); } catch { /* gone */ } continue; }
 			let g: any;
 			try { g = await hc(sock, ["get", t.address, "--json"]); } catch { continue; }
-			if (g?.labels?.["loop-native"]) { if (!unusedNative(g)) continue; }
+			if (g?.labels?.["loop-native"]) { if (!(await unusedNative(sock, g, t.address))) continue; }
 			// Never one the owner works in: a taken-over run's own Pi reports as pi, not pi-loop.
 			else if (g?.status && g.status.app !== "pi-loop") continue;
 			const at = Number(g?.labels?.["loop-ended"]);
@@ -175,7 +185,7 @@ export default function loopHerdr(pi: ExtensionAPI) {
 				if (x.native ? i < KEEP_NATIVE_PER_LOOP && now - x.at < KEEP_NATIVE_MS : i < KEEP_PER_LOOP && now - x.at < KEEP_MS) continue;
 				try {
 					// A native session is looked at again just before it goes: one the owner started using meanwhile stays.
-					if (x.native && !unusedNative(await hc(sock, ["get", x.address, "--json"]))) continue;
+					if (x.native && !(await unusedNative(sock, await hc(sock, ["get", x.address, "--json"]), x.address))) continue;
 					await hc(sock, ["kill", x.address]); await hc(sock, ["rm", x.address]);
 				} catch { /* gone */ }
 			}
@@ -203,11 +213,22 @@ export default function loopHerdr(pi: ExtensionAPI) {
 			if (!t) return;
 			// It stays, visibly done (or showing that the owner took the run over), until swept.
 			const labels = [`loop-status=${e.status}`, `loop-ended=${Date.now()}`];
-			// A native session also keeps its turn count from when its run ended: a later turn is the owner's, and keeps it from the sweep.
+			// A native session also keeps its turn count and screen from when its run ended: a later turn, or any change on its
+			// screen (a draft), is the owner's, and keeps it from the sweep.
 			const labelled = !e.agentKind ? hc(sock, ["label", t, ...labels])
-				: hc(sock, ["get", t, "--json"]).then(g => Number.isFinite(g?.turn) ? [`loop-turn=${g.turn}`] : [], () => []).then(more => hc(sock, ["label", t, ...labels, ...more]));
+				: hc(sock, ["get", t, "--json"]).catch(() => undefined)
+					.then(g => hc(sock, ["label", t, ...labels, ...(Number.isFinite(g?.turn) ? [`loop-turn=${g.turn}`] : [])]).then(() => g));
 			void labelled.catch(() => undefined)
 				.then(() => { if (!sweeping) sweeping = sweep(sock).finally(() => { sweeping = undefined; }); });
+			// Its screen once it has settled (the agent draws its last lines just after its turn ends), if nothing started since.
+			if (e.agentKind) setTimeout(() => {
+				void labelled.then(async (g: any) => {
+					const now = await hc(sock, ["get", t, "--json"]);
+					if (!Number.isFinite(g?.turn) || now?.turn !== g.turn || now?.status?.state === "working") return;
+					const screen = await screenOf(sock, t);
+					if (screen) await hc(sock, ["label", t, `loop-screen=${screen}`]);
+				}).catch(() => undefined);
+			}, SCREEN_SETTLE_MS).unref?.();
 		}
 	});
 
