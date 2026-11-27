@@ -22,6 +22,11 @@ test("a native run starts its program in a terminal, hands back its handle, and 
 		t10: { state: "live", turn: 3, status: { app: "claude-code", state: "idle" }, labels: { loop: "x", "loop-native": "claude", "loop-turn": "1", "loop-ended": String(old) } },
 		t11: { state: "live", turn: 1, status: { app: "claude-code", state: "done" }, labels: { loop: "x", "loop-native": "claude", "loop-turn": "1", "loop-ended": String(old - 1000) } },
 	};
+	// A watcher of the same loop, recent: the native sessions don't count against the watchers' own limit.
+	const ago = (m: number) => String(Date.now() - m * 60_000);
+	terminals.t13 = { state: "live", turn: 1, status: { app: "claude-code", state: "done" }, labels: { loop: "z", "loop-native": "claude", "loop-turn": "1", "loop-ended": ago(1) } };
+	terminals.t14 = { state: "live", turn: 1, status: { app: "claude-code", state: "done" }, labels: { loop: "z", "loop-native": "claude", "loop-turn": "1", "loop-ended": ago(2) } };
+	terminals.t15 = { state: "live", turn: 0, status: { app: "pi-loop", state: "done" }, labels: { loop: "z", "loop-ended": ago(3) } };
 	let t11Reads = 0;
 	const exec = t.mock.method(childProcess, "execFile", (_bin: string, args: string[], _o: unknown, cb: (e: unknown, out: string) => void) => {
 		calls.push(args);
@@ -67,4 +72,6 @@ test("a native run starts its program in a terminal, hands back its handle, and 
 	assert.ok(killed.includes("t9"), "an old native session nobody used is swept");
 	assert.ok(!killed.includes("t10"), "one the owner typed into since its run ended is theirs");
 	assert.ok(!killed.includes("t11"), "one the owner started using while the sweep ran stays");
+	assert.ok(!killed.includes("t15"), "a recent watcher is kept by the watchers' own limit, whatever native sessions its loop has");
+	assert.ok(killed.includes("t14") && !killed.includes("t13"), "only the newest native session per loop is kept");
 });

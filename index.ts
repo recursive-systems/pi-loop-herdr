@@ -167,7 +167,8 @@ export default function loopHerdr(pi: ExtensionAPI) {
 			if (Number.isFinite(at) && at > 0) ended.push({ address: t.address, loop: g.labels.loop ?? "", at, native: !!g.labels["loop-native"] });
 		}
 		const byLoop = new Map<string, typeof ended>();
-		for (const x of ended) byLoop.set(x.loop, [...(byLoop.get(x.loop) ?? []), x]);
+		// Native sessions and watchers are kept by their own limits, each counted apart.
+		for (const x of ended) { const k = `${x.native ? "native" : "watch"}#${x.loop}`; byLoop.set(k, [...(byLoop.get(k) ?? []), x]); }
 		for (const xs of byLoop.values()) {
 			xs.sort((a, b) => b.at - a.at);
 			for (const [i, x] of xs.entries()) {
